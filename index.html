@@ -1,0 +1,836 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GPS grátis (OpenLayers + OSRM) - Carro/Moto</title>
+
+  <link rel="stylesheet" href="https://unpkg.com/ol@10.7.0/ol.css" />
+
+  <style>
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    #map { height: 100vh; width: 100vw; }
+
+    .panel{
+      position: absolute; z-index: 10; top: 12px; left: 12px;
+      background: #fff; border-radius: 12px; padding: 12px;
+      width: min(560px, calc(100vw - 24px));
+      box-shadow: 0 10px 30px rgba(0,0,0,.14);
+    }
+
+    .row{ display:flex; gap:8px; align-items:center; flex-wrap: wrap; margin-top:8px; }
+    select, button{
+      padding: 8px 10px; border-radius: 10px; border: 1px solid #ddd; background:#fff;
+    }
+    button{ cursor:pointer; }
+    small{ display:block; color:#555; margin-top:6px; line-height:1.25; }
+    .muted{ color:#777; }
+
+    .steps{
+      margin-top:10px; max-height: 260px; overflow:auto;
+      border: 1px solid #eee; border-radius: 10px; padding: 8px;
+      font-size: 14px;
+    }
+    .step{ padding: 8px 6px; border-bottom: 1px solid #f1f1f1; border-radius: 8px; }
+    .step:last-child{ border-bottom: 0; }
+    .step.active{ background:#f6f7fb; outline: 2px solid #e7e9f5; }
+    .step .meta{ font-size: 12px; color:#666; margin-top:4px; }
+
+    .chips{ display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+    .chip{ padding: 6px 10px; border:1px solid #eee; border-radius:999px; font-size:12px; background:#fafafa; }
+
+    .danger{ color:#b91c1c; }
+    .ok{ color:#0f766e; }
+    .hint{ background:#fff7ed; border-color:#fed7aa; }
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <div><strong>GPS grátis</strong> <span class="chip">OpenLayers + OSRM</span></div>
+
+    <small class="muted">
+      Clique no mapa para adicionar pontos. Calcule a rota. Depois:
+      <b>Iniciar navegação</b> (GPS em HTTPS/localhost) ou <b>Simulação</b em file:// (clique no mapa para “andar”).
+    </small>
+
+    <div class="chips">
+      <div class="chip hint" id="chipEnv">Ambiente: —</div>
+      <div class="chip" id="chipNav">Navegação: —</div>
+      <div class="chip" id="chipGps">GPS: —</div>
+    </div>
+
+    <div class="row">
+      <label for="mode"><b>Modo</b></label>
+      <select id="mode">
+        <option value="car">🚗 Carro</option>
+        <option value="moto">🏍️ Moto</option>
+      </select>
+
+      <button id="btnLocate">📍 Minha localização</button>
+      <button id="btnSim">🧪 Alternar simulação</button>
+    </div>
+
+    <div class="row">
+      <label for="startSelect"><b>Origem</b></label>
+      <select id="startSelect"></select>
+
+      <label for="endSelect"><b>Destino</b></label>
+      <select id="endSelect"></select>
+    </div>
+
+    <div class="row">
+      <button id="btnRoute">🧭 Calcular rota</button>
+      <button id="btnNext">▶️ Próximo passo</button>
+      <button id="btnSpeak">🔊 Falar passo</button>
+      <button id="btnStopVoice">⏹️ Parar voz</button>
+      <button id="btnClear">🧹 Limpar</button>
+    </div>
+
+    <div class="row">
+      <button id="btnNavStart">🚀 Iniciar navegação</button>
+      <button id="btnNavStop">🛑 Parar navegação</button>
+    </div>
+
+    <div class="chips">
+      <div class="chip" id="chipSummary">Resumo: —</div>
+      <div class="chip" id="chipStep">Passo: —</div>
+    </div>
+
+    <small id="info"></small>
+
+    <div class="steps" id="steps">
+      <div class="muted">As instruções aparecem aqui…</div>
+    </div>
+  </div>
+
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/ol@10.7.0/dist/ol.js"></script>
+  <script>
+    const {
+      Map, View,
+      layer: { Tile: TileLayer, Vector: VectorLayer },
+      source: { OSM, Vector: VectorSource },
+      proj: { fromLonLat, toLonLat },
+      geom: { Point, LineString },
+      Feature,
+      style: { Style, Circle, Fill, Stroke },
+      sphere
+    } = ol;
+
+    // ===== UI =====
+    const startSelect = document.getElementById("startSelect");
+    const endSelect   = document.getElementById("endSelect");
+    const infoEl      = document.getElementById("info");
+    const stepsEl     = document.getElementById("steps");
+    const chipSummary = document.getElementById("chipSummary");
+    const chipStep    = document.getElementById("chipStep");
+    const chipGps     = document.getElementById("chipGps");
+    const chipNav     = document.getElementById("chipNav");
+    const chipEnv     = document.getElementById("chipEnv");
+    const modeEl      = document.getElementById("mode");
+
+    function setInfo(msg){ infoEl.textContent = msg || ""; }
+    function setSteps(html){ stepsEl.innerHTML = html || '<div class="muted">As instruções aparecem aqui…</div>'; }
+    function enableSelect(sel, enabled){ sel.disabled = !enabled; sel.style.opacity = enabled ? "1" : "0.6"; }
+
+    // ===== Environment detection =====
+    const isFile = location.protocol === "file:";
+    const isSecure = window.isSecureContext; // true em https e localhost (normalmente)
+    chipEnv.textContent = isFile ? "Ambiente: file:// (GPS real costuma ser bloqueado → simulação)" :
+                      (isSecure ? "Ambiente: seguro (HTTPS/localhost) → GPS deve funcionar" :
+                                 "Ambiente: não seguro (HTTP) → GPS pode falhar");
+
+    // ===== Format =====
+    const fmt = (n, d=5) => n.toLocaleString("pt-BR", { minimumFractionDigits: d, maximumFractionDigits: d });
+    function formatDist(m){
+      if(!Number.isFinite(m)) return "—";
+      if(m >= 1000) return `${(m/1000).toLocaleString("pt-BR",{maximumFractionDigits:2})} km`;
+      return `${Math.round(m).toLocaleString("pt-BR")} m`;
+    }
+    function formatMin(s){
+      const min = Math.round((s||0)/60);
+      return `${min.toLocaleString("pt-BR")} min`;
+    }
+
+    // ===== Distance helpers =====
+    function distMetersCoord3857(a3857, b3857){
+      return sphere.getDistance(toLonLat(a3857), toLonLat(b3857));
+    }
+    function distPointToLineMeters(point3857, line3857){
+      const closest = line3857.getClosestPoint(point3857);
+      return distMetersCoord3857(point3857, closest);
+    }
+
+    // ===== Layers =====
+    const markerSource = new VectorSource();
+    const routeSource  = new VectorSource();
+    const stepLineSource = new VectorSource();
+    const trailSource = new VectorSource();
+    const posSource = new VectorSource();
+
+    const markerLayer = new VectorLayer({
+      source: markerSource,
+      style: new Style({
+        image: new Circle({
+          radius: 7,
+          fill: new Fill({ color: "#2563eb" }),
+          stroke: new Stroke({ color: "#ffffff", width: 2 })
+        })
+      })
+    });
+
+    const routeLayer = new VectorLayer({
+      source: routeSource,
+      style: new Style({
+        stroke: new Stroke({ color: "#111827", width: 5 })
+      })
+    });
+
+    const stepLayer = new VectorLayer({
+      source: stepLineSource,
+      style: new Style({
+        stroke: new Stroke({ color: "#f59e0b", width: 7 })
+      })
+    });
+
+    const trailLayer = new VectorLayer({
+      source: trailSource,
+      style: new Style({
+        stroke: new Stroke({ color: "#06b6d4", width: 6 })
+      })
+    });
+
+    const posLayer = new VectorLayer({
+      source: posSource,
+      style: new Style({
+        image: new Circle({
+          radius: 8,
+          fill: new Fill({ color: "#10b981" }),
+          stroke: new Stroke({ color: "#ffffff", width: 2 })
+        })
+      })
+    });
+
+    // ===== Map =====
+    const map = new Map({
+      target: "map",
+      layers: [
+        new TileLayer({ source: new OSM() }),
+        routeLayer,
+        stepLayer,
+        trailLayer,
+        posLayer,
+        markerLayer
+      ],
+      view: new View({
+        center: fromLonLat([-48.4902, -1.4558]), // Belém
+        zoom: 13
+      })
+    });
+
+    // ===== State =====
+    const points = [];
+    let nextId = 1;
+
+    let lastRoute = null;
+    let lastLegSteps = [];
+    let stepIndex = -1;
+    let stepGeoms = [];
+    let routeLineGeom = null;
+
+    // live nav
+    let watchId = null;
+    let trailCoords = [];
+    let lastSpokenStep = -1;
+    let lastSpeakAt = 0;
+    let lastWarnedForStep = -1;
+    let lastRecalcAt = 0;
+    let lastGpsCoord3857 = null;
+
+    // simulation
+    let simModeEnabled = false;
+
+    // ===== Selects =====
+    function refreshSelects(){
+      const prevStart = startSelect.value;
+      const prevEnd   = endSelect.value;
+
+      startSelect.innerHTML = "";
+      endSelect.innerHTML   = "";
+
+      if(points.length === 0){
+        startSelect.innerHTML = `<option value="">Adicione um ponto no mapa…</option>`;
+        endSelect.innerHTML   = `<option value="">Selecione a origem primeiro…</option>`;
+        enableSelect(startSelect, false);
+        enableSelect(endSelect, false);
+        setInfo("Clique no mapa para adicionar o primeiro ponto.");
+        return;
+      }
+
+      enableSelect(startSelect, true);
+      points.forEach(p => {
+        const opt = document.createElement("option");
+        opt.value = String(p.id);
+        opt.textContent = `Ponto ${p.id} (Lat ${fmt(p.lat)}, Lon ${fmt(p.lon)})`;
+        startSelect.appendChild(opt);
+      });
+
+      if([...startSelect.options].some(o => o.value === prevStart)) startSelect.value = prevStart;
+      else startSelect.value = String(points[0].id);
+
+      const startId = Number(startSelect.value);
+
+      if(points.length < 2){
+        endSelect.innerHTML = `<option value="">Adicione outro ponto para destino…</option>`;
+        enableSelect(endSelect, false);
+        setInfo("Adicione mais um ponto para habilitar o destino.");
+        return;
+      }
+
+      enableSelect(endSelect, true);
+      points.filter(p => p.id !== startId).forEach(p => {
+        const opt = document.createElement("option");
+        opt.value = String(p.id);
+        opt.textContent = `Ponto ${p.id} (Lat ${fmt(p.lat)}, Lon ${fmt(p.lon)})`;
+        endSelect.appendChild(opt);
+      });
+
+      if([...endSelect.options].some(o => o.value === prevEnd)) endSelect.value = prevEnd;
+      else endSelect.value = endSelect.options[0]?.value || "";
+
+      setInfo(`Pontos: ${points.length} | Selecione destino e calcule a rota`);
+    }
+
+    startSelect.addEventListener("change", () => { refreshSelects(); clearRouteUI(); });
+
+    // ===== Add point =====
+    function addPoint(lon, lat){
+      const id = nextId++;
+      const f = new Feature({ geometry: new Point(fromLonLat([lon, lat])), id });
+      markerSource.addFeature(f);
+      points.push({ id, lon, lat, feature: f });
+      refreshSelects();
+      return id;
+    }
+
+    // clique no mapa cria ponto (se não estiver em simulação ativa)
+    map.on("singleclick", (evt) => {
+      if(simModeEnabled){
+        simMoveHandler(evt);
+        return;
+      }
+      const [lon, lat] = toLonLat(evt.coordinate);
+      addPoint(lon, lat);
+    });
+
+    // ===== Translation helpers =====
+    function emojiFor(mod){
+      return {
+        left:"⬅️", right:"➡️", straight:"⬆️",
+        slight_left:"↖️", slight_right:"↗️",
+        sharp_left:"↙️", sharp_right:"↘️"
+      }[mod] || "🧭";
+    }
+
+    function traduzManeuver(step){
+      const mode = modeEl.value;
+      const m = step.maneuver || {};
+      const type = m.type || "";
+      const mod = m.modifier || "";
+      const via = step.name ? ` em ${step.name}` : "";
+      const dirTxt = {
+        left: "à esquerda",
+        right: "à direita",
+        straight: "em frente",
+        slight_left: "levemente à esquerda",
+        slight_right: "levemente à direita",
+        sharp_left: "forte à esquerda",
+        sharp_right: "forte à direita"
+      }[mod];
+
+      const continueTxt = mode === "moto" ? "Siga" : "Continue";
+      const departTxt   = mode === "moto" ? "Saia e siga" : "Siga";
+
+      if(type === "depart") return `${departTxt} ${dirTxt || "em frente"}${via}`.trim();
+      if(type === "arrive") return `✅ Você chegou ao destino`;
+      if(type === "turn") return `Vire ${dirTxt || ""}${via}`.trim();
+      if(type === "new name") return `${continueTxt}${via}`;
+      if(type === "continue") return `${continueTxt} ${dirTxt || "em frente"}${via}`.trim();
+      if(type === "merge") return `Entre ${dirTxt || ""}${via}`.trim();
+      if(type === "on ramp") return `Acesse a alça${via}`;
+      if(type === "off ramp") return `Saia na alça${via}`;
+      if(type === "fork") return `Mantenha-se ${dirTxt || ""}${via}`.trim();
+      if(type === "roundabout" || type === "rotary") {
+        const exit = m.exit ? ` e pegue a ${m.exit}ª saída` : "";
+        return `Entre na rotatória${exit}${via}`;
+      }
+      if(type === "end of road") return `No fim da via, vire ${dirTxt || ""}${via}`.trim();
+      if(type === "use lane") return `Siga pela faixa indicada${via}`;
+      if(type === "uturn") return `Faça o retorno${via}`;
+      return (step.instruction || step.name || "Siga em frente");
+    }
+
+    // ===== Voice =====
+    function speak(text){
+      if(!("speechSynthesis" in window)){
+        setInfo("Seu navegador não suporta voz (SpeechSynthesis).");
+        return;
+      }
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = "pt-BR";
+      u.rate = (modeEl.value === "moto") ? 1.05 : 1.0;
+      window.speechSynthesis.speak(u);
+    }
+
+    function speakAuto(text){
+      const now = Date.now();
+      if(now - lastSpeakAt < 1800) return;
+      lastSpeakAt = now;
+      speak(text);
+    }
+
+    // ===== Route UI =====
+    function clearRouteUI(){
+      routeSource.clear();
+      stepLineSource.clear();
+      setSteps();
+      chipSummary.textContent = "Resumo: —";
+      chipStep.textContent = "Passo: —";
+      lastRoute = null;
+      lastLegSteps = [];
+      stepGeoms = [];
+      routeLineGeom = null;
+      stepIndex = -1;
+      lastWarnedForStep = -1;
+      lastSpokenStep = -1;
+      if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+    }
+
+    function renderStepsList(){
+      if(!lastRoute || !lastLegSteps.length){
+        setSteps('<div class="muted">As instruções aparecem aqui…</div>');
+        return;
+      }
+
+      const totalKm = (lastRoute.distance/1000).toLocaleString("pt-BR",{maximumFractionDigits:2});
+      const totalMin = formatMin(lastRoute.duration);
+      chipSummary.textContent = `Resumo: ${totalKm} km • ~${totalMin}`;
+
+      let html = "";
+      lastLegSteps.forEach((s, i) => {
+        const text = traduzManeuver(s);
+        const dist = formatDist(s.distance || 0);
+        const emo  = emojiFor(s.maneuver?.modifier || "");
+        html += `
+          <div class="step ${i===stepIndex ? "active":""}" data-i="${i}">
+            <div><b>${i+1}.</b> ${emo} ${text}</div>
+            <div class="meta">${dist}</div>
+          </div>`;
+      });
+
+      setSteps(html);
+
+      [...stepsEl.querySelectorAll(".step")].forEach(el => {
+        el.addEventListener("click", () => {
+          const i = Number(el.dataset.i);
+          setActiveStep(i, true);
+        });
+      });
+    }
+
+    function setActiveStep(i, center){
+      if(!lastLegSteps.length) return;
+      stepIndex = Math.max(0, Math.min(i, lastLegSteps.length - 1));
+
+      renderStepsList();
+
+      stepLineSource.clear();
+      const geom = stepGeoms[stepIndex];
+      if(geom){
+        stepLineSource.addFeature(new Feature({ geometry: geom }));
+        if(center){
+          map.getView().fit(geom.getExtent(), { padding: [90, 90, 90, 90], duration: 450, maxZoom: 18 });
+        }
+      }
+
+      chipStep.textContent = `Passo: ${stepIndex+1}/${lastLegSteps.length}`;
+      setInfo(traduzManeuver(lastLegSteps[stepIndex]));
+    }
+
+    // ===== OSRM route request =====
+    async function osrmRoute(lon1, lat1, lon2, lat2){
+      const url =
+        `https://router.project-osrm.org/route/v1/driving/` +
+        `${lon1},${lat1};${lon2},${lat2}` +
+        `?overview=full&geometries=geojson&steps=true&annotations=false`;
+      const res = await fetch(url);
+      if(!res.ok) throw new Error("Falha ao consultar OSRM");
+      return res.json();
+    }
+
+    async function buildRoute(lon1, lat1, lon2, lat2, fit){
+      setInfo("Calculando rota…");
+      setSteps('<div class="muted">Calculando instruções…</div>');
+      routeSource.clear();
+      stepLineSource.clear();
+
+      const data = await osrmRoute(lon1, lat1, lon2, lat2);
+      const route = data.routes?.[0];
+      if(!route) throw new Error("Sem rota");
+
+      lastRoute = route;
+      const leg = route.legs?.[0];
+      lastLegSteps = leg?.steps || [];
+
+      const coordsLonLat = route.geometry.coordinates;
+      const coordsMap = coordsLonLat.map(([lon,lat]) => fromLonLat([lon,lat]));
+      routeLineGeom = new LineString(coordsMap);
+      routeSource.addFeature(new Feature({ geometry: routeLineGeom }));
+
+      stepGeoms = lastLegSteps.map(s => {
+        const g = s.geometry;
+        if(!g || !g.coordinates) return null;
+        return new LineString(g.coordinates.map(([lon,lat]) => fromLonLat([lon,lat])));
+      });
+
+      stepIndex = 0;
+      lastSpokenStep = -1;
+      lastWarnedForStep = -1;
+
+      renderStepsList();
+      setActiveStep(0, false);
+
+      if(fit){
+        map.getView().fit(routeLineGeom.getExtent(), { padding: [90,90,90,90], duration: 450 });
+      }
+
+      setInfo("Rota pronta.");
+    }
+
+    document.getElementById("btnRoute").addEventListener("click", async () => {
+      const start = points.find(p => p.id === Number(startSelect.value));
+      const end   = points.find(p => p.id === Number(endSelect.value));
+      if(!start){ setInfo("Selecione a origem."); return; }
+      if(!end){ setInfo("Selecione o destino."); return; }
+      if(start.id === end.id){ setInfo("Origem e destino não podem ser o mesmo."); return; }
+      try{
+        await buildRoute(start.lon, start.lat, end.lon, end.lat, true);
+      }catch(e){
+        setInfo("Erro ao calcular rota.");
+      }
+    });
+
+    document.getElementById("btnNext").addEventListener("click", () => {
+      if(!lastLegSteps.length) { setInfo("Calcule uma rota primeiro."); return; }
+      setActiveStep(stepIndex + 1, true);
+    });
+
+    document.getElementById("btnSpeak").addEventListener("click", () => {
+      if(!lastLegSteps.length) { setInfo("Calcule uma rota primeiro."); return; }
+      speak(traduzManeuver(lastLegSteps[stepIndex]));
+    });
+
+    document.getElementById("btnStopVoice").addEventListener("click", () => {
+      if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+      setInfo("Voz parada.");
+    });
+
+    modeEl.addEventListener("change", () => {
+      if(lastLegSteps.length){
+        renderStepsList();
+        setActiveStep(stepIndex, false);
+      }
+    });
+
+    // ===== Navigation thresholds =====
+    function thresholds(){
+      const isMoto = modeEl.value === "moto";
+      return {
+        nearEndStep: isMoto ? 55 : 35,
+        warnAhead:   isMoto ? 220 : 160,
+        offRoute:    isMoto ? 70 : 45,
+        minMove:     isMoto ? 7 : 5
+      };
+    }
+
+    // ===== Trail & position =====
+    function updateTrail(){
+      trailSource.clear();
+      if(trailCoords.length < 2) return;
+      trailSource.addFeature(new Feature({ geometry: new LineString(trailCoords) }));
+    }
+
+    function updatePositionMarker(coord3857){
+      posSource.clear();
+      posSource.addFeature(new Feature({ geometry: new Point(coord3857) }));
+    }
+
+    // ===== Auto steps =====
+    function maybeWarnAhead(userCoord3857){
+      if(stepIndex < 0 || stepIndex >= stepGeoms.length) return;
+      const geom = stepGeoms[stepIndex];
+      if(!geom) return;
+
+      const end = geom.getLastCoordinate();
+      const d = distMetersCoord3857(userCoord3857, end);
+      const t = thresholds();
+
+      if(d <= t.warnAhead && d > t.nearEndStep && lastWarnedForStep !== stepIndex){
+        const nextText = traduzManeuver(lastLegSteps[stepIndex]);
+        speakAuto(`Em ${formatDist(d)}, ${nextText}`);
+        lastWarnedForStep = stepIndex;
+      }
+    }
+
+    function autoStepAdvance(userCoord3857){
+      if(!lastLegSteps.length || !stepGeoms.length) return;
+      if(stepIndex < 0) stepIndex = 0;
+
+      const t = thresholds();
+      const maxLookAhead = 3;
+
+      for(let i=0; i<=maxLookAhead; i++){
+        const idx = Math.min(stepIndex + i, stepGeoms.length - 1);
+        const geom = stepGeoms[idx];
+        if(!geom) continue;
+
+        const end = geom.getLastCoordinate();
+        const d = distMetersCoord3857(userCoord3857, end);
+
+        if(d <= t.nearEndStep){
+          const next = Math.min(idx + 1, stepGeoms.length - 1);
+          if(next !== stepIndex){
+            stepIndex = next;
+            setActiveStep(stepIndex, true);
+
+            const txt = traduzManeuver(lastLegSteps[stepIndex]);
+            if(stepIndex !== lastSpokenStep){
+              speakAuto(txt);
+              lastSpokenStep = stepIndex;
+            }
+          }
+          break;
+        }
+      }
+
+      maybeWarnAhead(userCoord3857);
+    }
+
+    async function maybeRecalcIfOffRoute(userCoord3857){
+      if(!routeLineGeom || !lastLegSteps.length) return;
+
+      const t = thresholds();
+      const d = distPointToLineMeters(userCoord3857, routeLineGeom);
+
+      chipGps.innerHTML = `GPS: <span class="${d > t.offRoute ? "danger" : "ok"}">${Math.round(d)} m da rota</span>`;
+
+      const now = Date.now();
+      if(d > t.offRoute && now - lastRecalcAt > 12000){
+        lastRecalcAt = now;
+        const end = points.find(p => p.id === Number(endSelect.value));
+        if(!end){ setInfo("Sem destino para recalcular."); return; }
+
+        setInfo("Fora da rota. Recalculando…");
+        const [lon, lat] = toLonLat(userCoord3857);
+
+        try{
+          await buildRoute(lon, lat, end.lon, end.lat, false);
+          speakAuto("Rota recalculada.");
+        }catch(e){
+          setInfo("Falha ao recalcular rota.");
+        }
+      }
+    }
+
+    // ===== Real GPS navigation =====
+    function startNavigation(){
+      if(!lastLegSteps.length){
+        setInfo("Calcule uma rota antes de iniciar a navegação.");
+        return;
+      }
+
+      // Se está em file://, ativa simulação automaticamente
+      if(isFile || !isSecure){
+        enableSimMode(true);
+        speakAuto("Simulação ativada. Clique no mapa para mover sua posição.");
+        return;
+      }
+
+      if(!navigator.geolocation){
+        setInfo("Geolocalização não disponível.");
+        enableSimMode(true);
+        return;
+      }
+
+      // desbloqueia voz
+      speakAuto("Navegação iniciada.");
+
+      chipNav.textContent = "Navegação: ATIVA (GPS)";
+      setInfo("Navegação iniciada (GPS).");
+
+      trailCoords = [];
+      trailSource.clear();
+      posSource.clear();
+      lastSpokenStep = -1;
+      lastWarnedForStep = -1;
+
+      watchId = navigator.geolocation.watchPosition(
+        async (pos) => {
+          const lon = pos.coords.longitude;
+          const lat = pos.coords.latitude;
+          const acc = pos.coords.accuracy;
+
+          const coord3857 = fromLonLat([lon, lat]);
+          lastGpsCoord3857 = coord3857;
+
+          updatePositionMarker(coord3857);
+
+          const t = thresholds();
+          const last = trailCoords[trailCoords.length - 1];
+          if(!last || distMetersCoord3857(coord3857, last) >= t.minMove){
+            trailCoords.push(coord3857);
+            updateTrail();
+          }
+
+          map.getView().animate({ center: coord3857, duration: 250 });
+
+          chipGps.textContent = `GPS: precisão ~${Math.round(acc)} m`;
+
+          autoStepAdvance(coord3857);
+          await maybeRecalcIfOffRoute(coord3857);
+        },
+        (err) => {
+          chipNav.textContent = "Navegação: —";
+          chipGps.textContent = "GPS: —";
+
+          if(err.code === 1){
+            setInfo("🚫 Localização negada. Vou ativar SIMULAÇÃO: clique no mapa para mover sua posição.");
+            speakAuto("Localização negada. Simulação ativada.");
+            enableSimMode(true);
+            return;
+          }
+
+          setInfo("Erro no GPS: " + err.message + " (ativando simulação)");
+          enableSimMode(true);
+        },
+        { enableHighAccuracy: true, maximumAge: 1200, timeout: 8000 }
+      );
+    }
+
+    function stopNavigation(){
+      if(watchId !== null){
+        navigator.geolocation.clearWatch(watchId);
+        watchId = null;
+      }
+      chipNav.textContent = "Navegação: —";
+      chipGps.textContent = "GPS: —";
+      setInfo("Navegação parada.");
+      if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+    }
+
+    // ===== Simulation navigation =====
+    function enableSimMode(forceOn){
+      if(forceOn === false){
+        disableSimMode();
+        return;
+      }
+      if(simModeEnabled) return;
+      simModeEnabled = true;
+      chipNav.textContent = "Navegação: SIMULAÇÃO";
+      setInfo("🧪 Simulação: clique no mapa para atualizar sua 'posição' e testar passos/voz.");
+
+      trailCoords = [];
+      trailSource.clear();
+      posSource.clear();
+      lastSpokenStep = -1;
+      lastWarnedForStep = -1;
+    }
+
+    function disableSimMode(){
+      simModeEnabled = false;
+      if(watchId === null){
+        chipNav.textContent = "Navegação: —";
+      }
+      setInfo("Simulação desativada.");
+    }
+
+    async function simMoveHandler(evt){
+      if(!lastLegSteps.length){
+        setInfo("Calcule uma rota antes de simular navegação.");
+        return;
+      }
+
+      const coord3857 = evt.coordinate;
+      lastGpsCoord3857 = coord3857;
+
+      updatePositionMarker(coord3857);
+
+      const t = thresholds();
+      const last = trailCoords[trailCoords.length - 1];
+      if(!last || distMetersCoord3857(coord3857, last) >= t.minMove){
+        trailCoords.push(coord3857);
+        updateTrail();
+      }
+
+      autoStepAdvance(coord3857);
+      await maybeRecalcIfOffRoute(coord3857);
+    }
+
+    // ===== Buttons =====
+    document.getElementById("btnNavStart").addEventListener("click", startNavigation);
+    document.getElementById("btnNavStop").addEventListener("click", () => {
+      stopNavigation();
+      disableSimMode();
+    });
+
+    document.getElementById("btnSim").addEventListener("click", () => {
+      if(simModeEnabled) disableSimMode();
+      else enableSimMode(true);
+    });
+
+    document.getElementById("btnLocate").addEventListener("click", () => {
+      if(!navigator.geolocation){
+        setInfo("Geolocalização não disponível.");
+        return;
+      }
+      setInfo("Obtendo sua localização…");
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const lon = pos.coords.longitude;
+          const lat = pos.coords.latitude;
+          const id = addPoint(lon, lat);
+          lastGpsCoord3857 = fromLonLat([lon, lat]);
+          map.getView().animate({ center: lastGpsCoord3857, zoom: 16, duration: 450 });
+          setInfo(`Localização adicionada como Ponto ${id}.`);
+        },
+        (err) => setInfo("Não foi possível obter localização: " + err.message),
+        { enableHighAccuracy: true, timeout: 8000 }
+      );
+    });
+
+    document.getElementById("btnClear").addEventListener("click", () => {
+      stopNavigation();
+      disableSimMode();
+      markerSource.clear();
+      trailSource.clear();
+      posSource.clear();
+      points.length = 0;
+      nextId = 1;
+      refreshSelects();
+      clearRouteUI();
+      setInfo("Tudo limpo.");
+    });
+
+    // ===== Init =====
+    refreshSelects();
+    clearRouteUI();
+
+    // Se abriu em file://, liga simulação “pronta” (não interfere em criar pontos; só ao iniciar navegação)
+    if(isFile){
+      setInfo("Você abriu em file://. Ao iniciar navegação, a simulação será usada (clique no mapa para mover).");
+    }
+  </script>
+</body>
+</html>
