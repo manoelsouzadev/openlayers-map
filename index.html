@@ -50,7 +50,7 @@
 
     <small class="muted">
       Clique no mapa para adicionar pontos. Calcule a rota. Depois:
-      <b>Iniciar navegação</b> (GPS em HTTPS/localhost) ou <b>Simulação</b em file:// (clique no mapa para “andar”).
+      <b>Iniciar navegação</b> (GPS em HTTPS/localhost) ou <b>Simulação</b> em file:// (clique no mapa para “andar”).
       <br><b>Novo:</b> clicando no <b>marcador verde</b> (sua posição) ele some do mapa.
     </small>
 
@@ -207,7 +207,7 @@
       source: posSource,
       style: new Style({
         image: new Circle({
-          radius: 12, // maior
+          radius: 12,
           fill: new Fill({ color: "#10b981" }),
           stroke: new Stroke({ color: "#ffffff", width: 3 })
         })
@@ -611,7 +611,7 @@
       if(simModeEnabled) return;
       simModeEnabled = true;
       chipNav.textContent = "Navegação: SIMULAÇÃO";
-      setInfo("🧪 Simulação: clique no mapa para atualizar sua 'posição' e testar passos/voz.");
+      setInfo("🧪 Simulação: clique no mapa para mover sua posição (depois de calcular rota).");
 
       trailCoords = [];
       trailSource.clear();
@@ -648,7 +648,7 @@
 
       if(isFile || !isSecure){
         enableSimMode(true);
-        speakAuto("Simulação ativada. Clique no mapa para mover sua posição.");
+        speakAuto("Simulação ativada. Agora clique no mapa para mover sua posição.");
         return;
       }
 
@@ -802,12 +802,13 @@
       }
     });
 
-    // ✅ UM ÚNICO CLIQUE NO MAPA:
-    // 1) se clicar no marcador verde -> some
-    // 2) se simulação ativa -> mover (simular andando)
-    // 3) senão -> adicionar ponto
+    // ✅ CLIQUE NO MAPA (CORRIGIDO):
+    // 1) clica no marcador verde -> oculta
+    // 2) se simulação ativa E NÃO tem rota -> adiciona ponto
+    // 3) se simulação ativa E tem rota -> move (simular andando)
+    // 4) caso normal -> adiciona ponto
     map.on("singleclick", async (evt) => {
-      // 1) tentou clicar no marcador verde?
+      // 1) marcador verde
       let hitPosMarker = false;
       map.forEachFeatureAtPixel(evt.pixel, (feature, layer) => {
         if(layer === posLayer){
@@ -821,13 +822,20 @@
       });
       if(hitPosMarker) return;
 
-      // 2) simulação
+      // 2) simulação mas sem rota -> criar ponto
+      if(simModeEnabled && (!lastLegSteps || lastLegSteps.length === 0)){
+        const [lon, lat] = toLonLat(evt.coordinate);
+        addPoint(lon, lat);
+        return;
+      }
+
+      // 3) simulação com rota -> mover
       if(simModeEnabled){
         await simMoveAt(evt.coordinate);
         return;
       }
 
-      // 3) adicionar ponto
+      // 4) normal -> criar ponto
       const [lon, lat] = toLonLat(evt.coordinate);
       addPoint(lon, lat);
     });
