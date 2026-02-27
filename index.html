@@ -1,4 +1,3 @@
-```html
 <!doctype html>
 <html lang="pt-br">
 <head>
@@ -203,12 +202,12 @@
       })
     });
 
-    // ✅ ALTERAÇÃO: ícone da posição maior
+    // ✅ ÍCONE DA POSIÇÃO MAIOR
     const posLayer = new VectorLayer({
       source: posSource,
       style: new Style({
         image: new Circle({
-          radius: 12, // <-- maior
+          radius: 12, // maior
           fill: new Fill({ color: "#10b981" }),
           stroke: new Stroke({ color: "#ffffff", width: 3 })
         })
@@ -249,7 +248,6 @@
     let lastSpeakAt = 0;
     let lastWarnedForStep = -1;
     let lastRecalcAt = 0;
-    let lastGpsCoord3857 = null;
 
     // simulation
     let simModeEnabled = false;
@@ -502,41 +500,6 @@
       setInfo("Rota pronta.");
     }
 
-    document.getElementById("btnRoute").addEventListener("click", async () => {
-      const start = points.find(p => p.id === Number(startSelect.value));
-      const end   = points.find(p => p.id === Number(endSelect.value));
-      if(!start){ setInfo("Selecione a origem."); return; }
-      if(!end){ setInfo("Selecione o destino."); return; }
-      if(start.id === end.id){ setInfo("Origem e destino não podem ser o mesmo."); return; }
-      try{
-        await buildRoute(start.lon, start.lat, end.lon, end.lat, true);
-      }catch(e){
-        setInfo("Erro ao calcular rota.");
-      }
-    });
-
-    document.getElementById("btnNext").addEventListener("click", () => {
-      if(!lastLegSteps.length) { setInfo("Calcule uma rota primeiro."); return; }
-      setActiveStep(stepIndex + 1, true);
-    });
-
-    document.getElementById("btnSpeak").addEventListener("click", () => {
-      if(!lastLegSteps.length) { setInfo("Calcule uma rota primeiro."); return; }
-      speak(traduzManeuver(lastLegSteps[stepIndex]));
-    });
-
-    document.getElementById("btnStopVoice").addEventListener("click", () => {
-      if ("speechSynthesis" in window) window.speechSynthesis.cancel();
-      setInfo("Voz parada.");
-    });
-
-    modeEl.addEventListener("change", () => {
-      if(lastLegSteps.length){
-        renderStepsList();
-        setActiveStep(stepIndex, false);
-      }
-    });
-
     // ===== Navigation thresholds =====
     function thresholds(){
       const isMoto = modeEl.value === "moto";
@@ -637,6 +600,45 @@
       }
     }
 
+    // ===== Simulation navigation =====
+    function enableSimMode(forceOn){
+      if(forceOn === false){
+        simModeEnabled = false;
+        if(watchId === null) chipNav.textContent = "Navegação: —";
+        setInfo("Simulação desativada.");
+        return;
+      }
+      if(simModeEnabled) return;
+      simModeEnabled = true;
+      chipNav.textContent = "Navegação: SIMULAÇÃO";
+      setInfo("🧪 Simulação: clique no mapa para atualizar sua 'posição' e testar passos/voz.");
+
+      trailCoords = [];
+      trailSource.clear();
+      posSource.clear();
+      lastSpokenStep = -1;
+      lastWarnedForStep = -1;
+    }
+
+    async function simMoveAt(coord3857){
+      if(!lastLegSteps.length){
+        setInfo("Calcule uma rota antes de simular navegação.");
+        return;
+      }
+
+      updatePositionMarker(coord3857);
+
+      const t = thresholds();
+      const last = trailCoords[trailCoords.length - 1];
+      if(!last || distMetersCoord3857(coord3857, last) >= t.minMove){
+        trailCoords.push(coord3857);
+        updateTrail();
+      }
+
+      autoStepAdvance(coord3857);
+      await maybeRecalcIfOffRoute(coord3857);
+    }
+
     // ===== Real GPS navigation =====
     function startNavigation(){
       if(!lastLegSteps.length){
@@ -644,7 +646,6 @@
         return;
       }
 
-      // file:// ou contexto não seguro -> simulação
       if(isFile || !isSecure){
         enableSimMode(true);
         speakAuto("Simulação ativada. Clique no mapa para mover sua posição.");
@@ -675,7 +676,6 @@
           const acc = pos.coords.accuracy;
 
           const coord3857 = fromLonLat([lon, lat]);
-          lastGpsCoord3857 = coord3857;
 
           updatePositionMarker(coord3857);
 
@@ -722,63 +722,43 @@
       if ("speechSynthesis" in window) window.speechSynthesis.cancel();
     }
 
-    // ===== Simulation navigation =====
-    function enableSimMode(forceOn){
-      if(forceOn === false){
-        disableSimMode();
-        return;
+    // ===== BOTÕES =====
+    document.getElementById("btnRoute").addEventListener("click", async () => {
+      const start = points.find(p => p.id === Number(startSelect.value));
+      const end   = points.find(p => p.id === Number(endSelect.value));
+      if(!start){ setInfo("Selecione a origem."); return; }
+      if(!end){ setInfo("Selecione o destino."); return; }
+      if(start.id === end.id){ setInfo("Origem e destino não podem ser o mesmo."); return; }
+      try{
+        await buildRoute(start.lon, start.lat, end.lon, end.lat, true);
+      }catch(e){
+        setInfo("Erro ao calcular rota.");
       }
-      if(simModeEnabled) return;
-      simModeEnabled = true;
-      chipNav.textContent = "Navegação: SIMULAÇÃO";
-      setInfo("🧪 Simulação: clique no mapa para atualizar sua 'posição' e testar passos/voz.");
+    });
 
-      trailCoords = [];
-      trailSource.clear();
-      posSource.clear();
-      lastSpokenStep = -1;
-      lastWarnedForStep = -1;
-    }
+    document.getElementById("btnNext").addEventListener("click", () => {
+      if(!lastLegSteps.length) { setInfo("Calcule uma rota primeiro."); return; }
+      setActiveStep(stepIndex + 1, true);
+    });
 
-    function disableSimMode(){
-      simModeEnabled = false;
-      if(watchId === null){
-        chipNav.textContent = "Navegação: —";
-      }
-      setInfo("Simulação desativada.");
-    }
+    document.getElementById("btnSpeak").addEventListener("click", () => {
+      if(!lastLegSteps.length) { setInfo("Calcule uma rota primeiro."); return; }
+      speak(traduzManeuver(lastLegSteps[stepIndex]));
+    });
 
-    async function simMoveHandler(evt){
-      if(!lastLegSteps.length){
-        setInfo("Calcule uma rota antes de simular navegação.");
-        return;
-      }
+    document.getElementById("btnStopVoice").addEventListener("click", () => {
+      if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+      setInfo("Voz parada.");
+    });
 
-      const coord3857 = evt.coordinate;
-      lastGpsCoord3857 = coord3857;
-
-      updatePositionMarker(coord3857);
-
-      const t = thresholds();
-      const last = trailCoords[trailCoords.length - 1];
-      if(!last || distMetersCoord3857(coord3857, last) >= t.minMove){
-        trailCoords.push(coord3857);
-        updateTrail();
-      }
-
-      autoStepAdvance(coord3857);
-      await maybeRecalcIfOffRoute(coord3857);
-    }
-
-    // ===== Buttons =====
     document.getElementById("btnNavStart").addEventListener("click", startNavigation);
     document.getElementById("btnNavStop").addEventListener("click", () => {
       stopNavigation();
-      disableSimMode();
+      enableSimMode(false);
     });
 
     document.getElementById("btnSim").addEventListener("click", () => {
-      if(simModeEnabled) disableSimMode();
+      if(simModeEnabled) enableSimMode(false);
       else enableSimMode(true);
     });
 
@@ -793,8 +773,8 @@
           const lon = pos.coords.longitude;
           const lat = pos.coords.latitude;
           const id = addPoint(lon, lat);
-          lastGpsCoord3857 = fromLonLat([lon, lat]);
-          map.getView().animate({ center: lastGpsCoord3857, zoom: 16, duration: 450 });
+          const coord = fromLonLat([lon, lat]);
+          map.getView().animate({ center: coord, zoom: 16, duration: 450 });
           setInfo(`Localização adicionada como Ponto ${id}.`);
         },
         (err) => setInfo("Não foi possível obter localização: " + err.message),
@@ -804,7 +784,7 @@
 
     document.getElementById("btnClear").addEventListener("click", () => {
       stopNavigation();
-      disableSimMode();
+      enableSimMode(false);
       markerSource.clear();
       trailSource.clear();
       posSource.clear();
@@ -815,12 +795,23 @@
       setInfo("Tudo limpo.");
     });
 
-    // ✅ ALTERAÇÃO: clicar no marcador verde (posição) faz ele sumir
-    map.on("singleclick", (evt) => {
-      if(simModeEnabled) return; // em simulação, clique já é "andar"
+    modeEl.addEventListener("change", () => {
+      if(lastLegSteps.length){
+        renderStepsList();
+        setActiveStep(stepIndex, false);
+      }
+    });
 
+    // ✅ UM ÚNICO CLIQUE NO MAPA:
+    // 1) se clicar no marcador verde -> some
+    // 2) se simulação ativa -> mover (simular andando)
+    // 3) senão -> adicionar ponto
+    map.on("singleclick", async (evt) => {
+      // 1) tentou clicar no marcador verde?
+      let hitPosMarker = false;
       map.forEachFeatureAtPixel(evt.pixel, (feature, layer) => {
         if(layer === posLayer){
+          hitPosMarker = true;
           posSource.clear();
           chipGps.textContent = "GPS: marcador ocultado";
           setInfo("Marcador de posição removido.");
@@ -828,6 +819,17 @@
         }
         return false;
       });
+      if(hitPosMarker) return;
+
+      // 2) simulação
+      if(simModeEnabled){
+        await simMoveAt(evt.coordinate);
+        return;
+      }
+
+      // 3) adicionar ponto
+      const [lon, lat] = toLonLat(evt.coordinate);
+      addPoint(lon, lat);
     });
 
     // ===== Init =====
@@ -840,4 +842,3 @@
   </script>
 </body>
 </html>
-```
