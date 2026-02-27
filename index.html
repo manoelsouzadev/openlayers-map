@@ -49,8 +49,9 @@
     <div><strong>GPS grátis</strong> <span class="chip">OpenLayers + OSRM</span></div>
 
     <small class="muted">
-      Clique no mapa para adicionar pontos. Calcule a rota. Depois:
-      <b>Iniciar navegação</b> (GPS em HTTPS/localhost) ou <b>Simulação</b> em file:// (clique no mapa para “andar”).
+      Clique no mapa para adicionar pontos.
+      <br>✅ <b>Novo:</b> clique em um <b>ponto azul</b> para removê-lo.
+      <br>Calcule a rota. Depois: <b>Iniciar navegação</b> (GPS em HTTPS/localhost) ou <b>Simulação</b> em file://.
       <br><b>Novo:</b> clicando no <b>marcador verde</b> (sua posição) ele some do mapa.
     </small>
 
@@ -305,14 +306,32 @@
 
     startSelect.addEventListener("change", () => { refreshSelects(); clearRouteUI(); });
 
-    // ===== Add point =====
+    // ===== Add/remove point =====
     function addPoint(lon, lat){
       const id = nextId++;
-      const f = new Feature({ geometry: new Point(fromLonLat([lon, lat])), id });
+      const f = new Feature({ geometry: new Point(fromLonLat([lon, lat])) });
+      f.set("type","marker");
+      f.set("id", id);
+
       markerSource.addFeature(f);
       points.push({ id, lon, lat, feature: f });
       refreshSelects();
       return id;
+    }
+
+    function removePointById(id){
+      const idx = points.findIndex(p => p.id === id);
+      if(idx === -1) return;
+
+      const p = points[idx];
+      markerSource.removeFeature(p.feature);
+      points.splice(idx, 1);
+
+      // se removeu ponto, a rota atual pode ficar inválida -> limpa
+      clearRouteUI();
+
+      refreshSelects();
+      setInfo(`Ponto ${id} removido.`);
     }
 
     // ===== Translation helpers =====
@@ -802,40 +821,54 @@
       }
     });
 
-    // ✅ CLIQUE NO MAPA (CORRIGIDO):
+    // ✅ CLIQUE NO MAPA:
     // 1) clica no marcador verde -> oculta
-    // 2) se simulação ativa E NÃO tem rota -> adiciona ponto
-    // 3) se simulação ativa E tem rota -> move (simular andando)
-    // 4) caso normal -> adiciona ponto
+    // 2) clica em um ponto azul -> remove ele
+    // 3) simulação sem rota -> adiciona ponto
+    // 4) simulação com rota -> move
+    // 5) normal -> adiciona ponto
     map.on("singleclick", async (evt) => {
-      // 1) marcador verde
-      let hitPosMarker = false;
+      let handled = false;
+
+      // (1) e (2): checar se clicou em algum feature (posição ou marcador azul)
       map.forEachFeatureAtPixel(evt.pixel, (feature, layer) => {
+        // marcador verde (posição)
         if(layer === posLayer){
-          hitPosMarker = true;
           posSource.clear();
           chipGps.textContent = "GPS: marcador ocultado";
           setInfo("Marcador de posição removido.");
+          handled = true;
           return true;
+        }
+
+        // ponto azul (marcador)
+        if(layer === markerLayer && feature.get("type") === "marker"){
+          const id = feature.get("id");
+          if(Number.isFinite(id)){
+            removePointById(id);
+            handled = true;
+            return true;
+          }
         }
         return false;
       });
-      if(hitPosMarker) return;
 
-      // 2) simulação mas sem rota -> criar ponto
+      if(handled) return;
+
+      // (3) simulação sem rota -> criar ponto
       if(simModeEnabled && (!lastLegSteps || lastLegSteps.length === 0)){
         const [lon, lat] = toLonLat(evt.coordinate);
         addPoint(lon, lat);
         return;
       }
 
-      // 3) simulação com rota -> mover
+      // (4) simulação com rota -> mover
       if(simModeEnabled){
         await simMoveAt(evt.coordinate);
         return;
       }
 
-      // 4) normal -> criar ponto
+      // (5) normal -> criar ponto
       const [lon, lat] = toLonLat(evt.coordinate);
       addPoint(lon, lat);
     });
