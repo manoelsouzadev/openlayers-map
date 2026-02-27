@@ -1,0 +1,872 @@
+<!doctype html>
+<html lang="pt-br">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pontos + Drag (Translate) + Pin + SQLite (OpenLayers + OSRM)</title>
+
+    <link rel="stylesheet" href="https://unpkg.com/ol@10.7.0/ol.css" />
+    <style>
+        body {
+            margin: 0;
+            font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+            height: 100vh;
+        }
+
+        .app {
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        #map {
+            flex: 1;
+            width: 100vw;
+        }
+
+        .panel {
+            background: #fff;
+            border-top: 1px solid #eee;
+            padding: 12px;
+            box-shadow: 0 -10px 30px rgba(0, 0, 0, .10);
+            max-height: 42vh;
+            overflow: auto;
+        }
+
+        .row {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+            margin-top: 8px;
+        }
+
+        button,
+        input {
+            padding: 8px 10px;
+            border-radius: 10px;
+            border: 1px solid #ddd;
+            background: #fff;
+        }
+
+        button {
+            cursor: pointer;
+        }
+
+        button.primary {
+            border-color: #bfdbfe;
+            background: #eff6ff;
+        }
+
+        button.active {
+            border-color: #86efac;
+            background: #f0fdf4;
+        }
+
+        small {
+            display: block;
+            color: #555;
+            margin-top: 6px;
+            line-height: 1.25;
+        }
+
+        .chips {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-top: 8px;
+        }
+
+        .chip {
+            padding: 6px 10px;
+            border: 1px solid #eee;
+            border-radius: 999px;
+            font-size: 12px;
+            background: #fafafa;
+        }
+
+        .list {
+            margin-top: 10px;
+            max-height: 280px;
+            overflow: auto;
+            border: 1px solid #eee;
+            border-radius: 10px;
+            padding: 8px;
+            font-size: 14px;
+            background: #fff;
+        }
+
+        .item {
+            padding: 8px;
+            border-bottom: 1px solid #f1f1f1;
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .item:last-child {
+            border-bottom: 0;
+        }
+
+        .meta {
+            font-size: 12px;
+            color: #666;
+            margin-top: 3px;
+        }
+
+        .left {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            cursor: pointer;
+        }
+
+        .actions {
+            display: flex;
+            gap: 6px;
+            align-items: center;
+        }
+
+        .danger {
+            border-color: #fecaca;
+            background: #fff1f2;
+        }
+
+        .ok {
+            border-color: #bbf7d0;
+            background: #f0fdf4;
+        }
+
+        .muted {
+            color: #777;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="app">
+        <div id="map"></div>
+
+        <div class="panel">
+            <div><strong>Pontos + Drag + Pin + SQLite</strong> <span class="chip">OpenLayers + OSRM</span></div>
+            <small>
+                Clique no mapa para adicionar pontos (somente quando o modo estiver liberado).
+                <b>Arraste o PIN tocando/segurando em qualquer parte dele</b> (só com Adicionar ON).
+                Enter renomeia. 🗑️ remove.
+            </small>
+
+            <div class="row">
+                <button id="btnToggleAdd" class="primary">➕ Liberar para adicionar: OFF</button>
+                <button id="btnClear" class="danger">🧹 Limpar tudo</button>
+                <button id="btnExport" class="ok">💾 Exportar .sqlite</button>
+
+                <label class="ok" id="lblImport"
+                    style="display:inline-flex; gap:8px; align-items:center; padding:6px 10px; border-radius:10px; border:1px solid #bbf7d0;">
+                    📥 Importar
+                    <input id="fileImport" type="file" accept=".sqlite,.db,application/octet-stream"
+                        style="display:none;">
+                </label>
+            </div>
+
+            <div class="row">
+                <input id="addrInput" type="text" placeholder="Pesquisar endereço (ex: Av. Nazaré, Belém)"
+                    style="flex:1; min-width:220px;">
+                <button id="btnAddrSearch" class="primary" type="button">🔎 Buscar</button>
+                <button id="btnAddrPin" type="button">📍 Buscar e criar pin</button>
+            </div>
+
+            <div class="chips">
+                <div class="chip" id="chipPoints">Pontos: 0</div>
+                <div class="chip" id="chipRoutes">Rotas: 0</div>
+                <div class="chip" id="chipStatus">Status: iniciando…</div>
+                <div class="chip" id="chipAdd">Adicionar: OFF</div>
+            </div>
+
+            <small id="info" class="muted"></small>
+
+            <div class="list" id="list">
+                <div class="muted">Carregando banco…</div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/ol@10.7.0/dist/ol.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.2/sql-wasm.js"></script>
+
+    <script>
+        // =========================
+        // UI
+        // =========================
+        const chipPoints = document.getElementById("chipPoints");
+        const chipRoutes = document.getElementById("chipRoutes");
+        const chipStatus = document.getElementById("chipStatus");
+        const chipAdd = document.getElementById("chipAdd");
+        const infoEl = document.getElementById("info");
+        const listEl = document.getElementById("list");
+
+        const btnToggleAdd = document.getElementById("btnToggleAdd");
+        const btnClear = document.getElementById("btnClear");
+        const btnExport = document.getElementById("btnExport");
+        const fileImport = document.getElementById("fileImport");
+        const lblImport = document.getElementById("lblImport");
+
+
+        const addrInput = document.getElementById("addrInput");
+        const btnAddrSearch = document.getElementById("btnAddrSearch");
+        const btnAddrPin = document.getElementById("btnAddrPin");
+
+        function setInfo(msg) { infoEl.textContent = msg || ""; }
+        function setStatus(msg) { chipStatus.textContent = "Status: " + msg; }
+
+        // =========================
+        // Helpers
+        // =========================
+        function haversineMeters(lon1, lat1, lon2, lat2) {
+            const R = 6371000;
+            const toRad = (x) => x * Math.PI / 180;
+            const dLat = toRad(lat2 - lat1);
+            const dLon = toRad(lon2 - lon1);
+            const a =
+                Math.sin(dLat / 2) ** 2 +
+                Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+            return 2 * R * Math.asin(Math.sqrt(a));
+        }
+        const fmt = (n, d = 5) => n.toLocaleString("pt-BR", { minimumFractionDigits: d, maximumFractionDigits: d });
+
+        async function geocodeAddress(query) {
+            const url =
+                "https://nominatim.openstreetmap.org/search" +
+                "?format=jsonv2" +
+                "&limit=5" +
+                "&addressdetails=1" +
+                "&q=" + encodeURIComponent(query);
+
+            const res = await fetch(url, {
+                headers: {
+                    // Nominatim prefere identificação; em browser isso é limitado,
+                    // mas ajuda ter Accept-Language.
+                    "Accept": "application/json",
+                    "Accept-Language": "pt-BR"
+                }
+            });
+
+            if (!res.ok) throw new Error("Falha no geocoding (" + res.status + ")");
+            return res.json(); // array de resultados
+        }
+
+        // =========================
+        // OpenLayers
+        // =========================
+        const {
+            Map, View,
+            layer: { Tile: TileLayer, Vector: VectorLayer },
+            source: { OSM, Vector: VectorSource },
+            proj: { fromLonLat, toLonLat },
+            geom: { Point, LineString },
+            Feature,
+            style: { Style, Icon, Text, Fill, Stroke },
+            interaction: { Translate }
+        } = ol;
+
+        const markerSource = new VectorSource();
+        const routesSource = new VectorSource();
+
+        // PIN vazado (furo branco no meio)
+        function pinSvgDataUri(color = "#2563eb") {
+            const svg = `
+        <svg xmlns="http://www.w3.org/2000/svg" width="32" height="44" viewBox="0 0 32 44">
+          <path d="M16 43s12-12.1 12-24C28 8.5 22.6 3 16 3S4 8.5 4 19c0 11.9 12 24 12 24z"
+                fill="${color}" stroke="#ffffff" stroke-width="2"/>
+          <circle cx="16" cy="19" r="6" fill="#ffffff" opacity="0.95"/>
+        </svg>`.trim();
+            return "data:image/svg+xml;utf8," + encodeURIComponent(svg);
+        }
+
+        function markerStyle(name) {
+            return new Style({
+                image: new Icon({
+                    src: pinSvgDataUri("#2563eb"),
+                    anchor: [0.5, 1],
+                    scale: 1
+                }),
+                text: new Text({
+                    text: name || "",
+                    offsetY: -34,
+                    font: "bold 12px system-ui, -apple-system, Segoe UI, Roboto, Arial",
+                    fill: new Fill({ color: "#111827" }),
+                    stroke: new Stroke({ color: "#ffffff", width: 3 })
+                })
+            });
+        }
+
+        const markerLayer = new VectorLayer({
+            source: markerSource,
+            style: (feature) => markerStyle(feature.get("name") || "")
+        });
+
+        const routesLayer = new VectorLayer({
+            source: routesSource,
+            style: new Style({ stroke: new Stroke({ color: "#111827", width: 4 }) })
+        });
+
+        const map = new Map({
+            target: "map",
+            layers: [
+                new TileLayer({ source: new OSM() }),
+                routesLayer,
+                markerLayer
+            ],
+            view: new View({
+                center: fromLonLat([-48.4902, -1.4558]),
+                zoom: 13
+            })
+        });
+
+        // Translate: arrasta o PIN inteiro (sem bolinhas/handles)
+        const translate = new Translate({
+            layers: [markerLayer] // só arrasta marcadores
+        });
+        map.addInteraction(translate);
+
+        // =========================
+        // Modo adicionar/arrastar
+        // =========================  
+        let addEnabled = false;
+
+        function updateAddUI() {
+            chipAdd.textContent = "Adicionar: " + (addEnabled ? "ON" : "OFF");
+            btnToggleAdd.textContent = "➕ Liberar para adicionar: " + (addEnabled ? "ON" : "OFF");
+            btnToggleAdd.classList.toggle("active", addEnabled);
+
+            // ✅ aqui controla o arrasto
+            translate.setActive(addEnabled);
+
+            setInfo(addEnabled
+                ? "Adicionar/Arrastar ATIVO: clique para adicionar e arraste o pin."
+                : "Adicionar/Arrastar DESATIVADO: aperte o botão para liberar."
+            );
+        }
+
+        btnToggleAdd.addEventListener("click", () => {
+            addEnabled = !addEnabled;
+            updateAddUI();
+        });
+
+        // =========================
+        // SQLite (sql.js) + IndexedDB
+        // =========================
+        let SQL = null;
+        let db = null;
+        const DB_NAME = "points.sqlite";
+        const IDB_DB = "gps_sqlite_store";
+        const IDB_KEY = "db_file";
+
+        function idbOpen() {
+            return new Promise((resolve, reject) => {
+                const req = indexedDB.open(IDB_DB, 1);
+                req.onupgradeneeded = () => req.result.createObjectStore("files");
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+            });
+        }
+        async function idbGet() {
+            const idb = await idbOpen();
+            return new Promise((resolve, reject) => {
+                const tx = idb.transaction("files", "readonly");
+                const store = tx.objectStore("files");
+                const req = store.get(IDB_KEY);
+                req.onsuccess = () => resolve(req.result || null);
+                req.onerror = () => reject(req.error);
+            });
+        }
+        async function idbSet(uint8) {
+            const idb = await idbOpen();
+            return new Promise((resolve, reject) => {
+                const tx = idb.transaction("files", "readwrite");
+                tx.objectStore("files").put(uint8, IDB_KEY);
+                tx.oncomplete = () => resolve();
+                tx.onerror = () => reject(tx.error);
+            });
+        }
+        async function idbClear() {
+            const idb = await idbOpen();
+            return new Promise((resolve, reject) => {
+                const tx = idb.transaction("files", "readwrite");
+                tx.objectStore("files").delete(IDB_KEY);
+                tx.oncomplete = () => resolve();
+                tx.onerror = () => reject(tx.error);
+            });
+        }
+
+        function dbInitSchema() {
+            db.run(`
+        CREATE TABLE IF NOT EXISTS points (
+          id   INTEGER PRIMARY KEY,
+          name TEXT NOT NULL,
+          lon  REAL NOT NULL,
+          lat  REAL NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+        }
+        async function dbSave() {
+            const data = db.export();
+            await idbSet(data);
+        }
+        async function dbLoadOrCreate() {
+            setStatus("carregando SQLite…");
+            SQL = await initSqlJs({
+                locateFile: (file) => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.2/${file}`
+            });
+
+            const stored = await idbGet();
+            db = stored ? new SQL.Database(stored) : new SQL.Database();
+            dbInitSchema();
+            await dbSave();
+            setStatus("pronto");
+        }
+
+        // =========================
+        // App state
+        // =========================
+        const points = []; // { id, name, lon, lat }
+        let routesCount = 0;
+        let rebuilding = false;
+        let needsRebuild = false;
+        let rebuildAbort = null;
+
+        function updateChips() {
+            chipPoints.textContent = `Pontos: ${points.length}`;
+            chipRoutes.textContent = `Rotas: ${routesCount}`;
+        }
+
+        // =========================
+        // OSRM
+        // =========================
+        async function osrmRouteDriving(lon1, lat1, lon2, lat2, signal) {
+            const url =
+                `https://router.project-osrm.org/route/v1/driving/` +
+                `${lon1},${lat1};${lon2},${lat2}` +
+                `?overview=full&geometries=geojson&steps=false&annotations=false`;
+            const res = await fetch(url, { signal });
+            if (!res.ok) throw new Error("Falha no OSRM (" + res.status + ")");
+            return res.json();
+        }
+
+        // =========================
+        // List
+        // =========================
+        function escapeHtml(s) {
+            return String(s).replace(/[&<>"']/g, (c) => ({
+                "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+            }[c]));
+        }
+        function escapeAttr(s) { return escapeHtml(s).replace(/"/g, "&quot;"); }
+
+        function renderList() {
+            if (points.length === 0) {
+                listEl.innerHTML = `<div class="muted">Nenhum ponto ainda.</div>`;
+                return;
+            }
+            const sorted = [...points].sort((a, b) => a.id - b.id);
+            listEl.innerHTML = sorted.map(p => `
+        <div class="item" data-id="${p.id}">
+          <div class="left" title="Toque para centralizar">
+            <div><b>${escapeHtml(p.name)}</b> <span class="muted">(#${p.id})</span></div>
+            <div class="meta">Lat ${fmt(p.lat)} • Lon ${fmt(p.lon)}</div>
+          </div>
+          <div class="actions">
+            <input class="nameInput" type="text" value="${escapeAttr(p.name)}" placeholder="Nome" style="width:160px" />
+            <button class="btnRename" type="button">✏️</button>
+            <button class="btnRemove danger" type="button">🗑️</button>
+          </div>
+        </div>
+      `).join("");
+        }
+
+        listEl.addEventListener("click", async (e) => {
+            const row = e.target.closest(".item");
+            if (!row) return;
+            const id = Number(row.dataset.id);
+            const inp = row.querySelector(".nameInput");
+
+            if (e.target.closest(".btnRemove")) {
+                e.preventDefault(); e.stopPropagation();
+                if (!confirm("Remover este ponto?")) return;
+                await removePoint(id);
+                return;
+            }
+
+            if (e.target.closest(".btnRename")) {
+                e.preventDefault(); e.stopPropagation();
+                const newName = (inp.value || "").trim();
+                if (!newName) { setInfo("Nome não pode ficar vazio."); return; }
+                await renamePoint(id, newName);
+                return;
+            }
+
+            if (e.target.closest(".left")) {
+                const p = points.find(x => x.id === id);
+                if (!p) return;
+                map.getView().animate({ center: fromLonLat([p.lon, p.lat]), zoom: 16, duration: 350 });
+            }
+        });
+
+        listEl.addEventListener("keydown", async (e) => {
+            if (e.key !== "Enter") return;
+            const row = e.target.closest(".item");
+            if (!row) return;
+            if (!e.target.classList.contains("nameInput")) return;
+
+            e.preventDefault(); e.stopPropagation();
+            const id = Number(row.dataset.id);
+            const newName = (e.target.value || "").trim();
+            if (!newName) { setInfo("Nome não pode ficar vazio."); return; }
+            await renamePoint(id, newName);
+            e.target.blur();
+        });
+
+        // =========================
+        // DB ops
+        // =========================
+        async function loadPointsFromDb() {
+            points.length = 0;
+            markerSource.clear();
+            routesSource.clear();
+            routesCount = 0;
+
+            const res = db.exec("SELECT id, name, lon, lat FROM points ORDER BY id ASC;");
+            const rows = res?.[0]?.values || [];
+
+            for (const [id, name, lon, lat] of rows) {
+                const f = new Feature({ geometry: new Point(fromLonLat([lon, lat])) });
+                f.setId(Number(id));
+                f.set("name", String(name));
+                markerSource.addFeature(f);
+
+                points.push({ id: Number(id), name: String(name), lon: Number(lon), lat: Number(lat) });
+            }
+
+            updateChips();
+            renderList();
+            await rebuildRoutes();
+        }
+
+        async function insertPoint(lon, lat) {
+            const r = db.exec("SELECT COALESCE(MAX(id), 0) AS maxId FROM points;");
+            const maxId = r?.[0]?.values?.[0]?.[0] || 0;
+            const id = Number(maxId) + 1;
+
+            const name = `Ponto ${id}`;
+            db.run("INSERT INTO points (id, name, lon, lat) VALUES (?, ?, ?, ?);", [id, name, lon, lat]);
+            await dbSave();
+
+            const f = new Feature({ geometry: new Point(fromLonLat([lon, lat])) });
+            f.setId(id);
+            f.set("name", name);
+            markerSource.addFeature(f);
+
+            points.push({ id, name, lon, lat });
+
+            updateChips();
+            renderList();
+        }
+
+        async function renamePoint(id, newName) {
+            db.run("UPDATE points SET name = ? WHERE id = ?;", [newName, id]);
+            await dbSave();
+
+            const p = points.find(x => x.id === id);
+            if (p) p.name = newName;
+
+            const f = markerSource.getFeatureById(id);
+            if (f) { f.set("name", newName); f.changed(); }
+
+            renderList();
+            setInfo(`✅ Renomeado: #${id} → ${newName}`);
+        }
+
+        async function removePoint(id) {
+            db.run("DELETE FROM points WHERE id = ?;", [id]);
+            await dbSave();
+
+            const f = markerSource.getFeatureById(id);
+            if (f) markerSource.removeFeature(f);
+
+            const idx = points.findIndex(x => x.id === id);
+            if (idx >= 0) points.splice(idx, 1);
+
+            updateChips();
+            renderList();
+            await rebuildRoutes();
+            setInfo(`🗑️ Ponto #${id} removido.`);
+        }
+
+        async function updatePointCoords(id, lon, lat) {
+            db.run("UPDATE points SET lon = ?, lat = ? WHERE id = ?;", [lon, lat, id]);
+            await dbSave();
+
+            const p = points.find(x => x.id === id);
+            if (p) { p.lon = lon; p.lat = lat; }
+            renderList();
+        }
+
+        // =========================
+        // Rebuild routes (mais próximo anterior)
+        // =========================
+
+        async function rebuildRoutes() {
+            // Se já está reconstruindo, marca que precisa rodar de novo e sai
+            if (rebuilding) {
+                needsRebuild = true;
+                return;
+            }
+
+            rebuilding = true;
+
+            do {
+                needsRebuild = false;
+
+                if (rebuildAbort) rebuildAbort.abort();
+                rebuildAbort = new AbortController();
+                const { signal } = rebuildAbort;
+
+                routesSource.clear();
+                routesCount = 0;
+                updateChips();
+
+                const sorted = [...points].sort((a, b) => a.id - b.id);
+                if (sorted.length < 2) {
+                    setStatus("pronto");
+                    continue;
+                }
+
+                setStatus("recalculando rotas…");
+
+                for (let i = 1; i < sorted.length; i++) {
+                    // se durante o loop alguém pediu rebuild de novo, pode interromper cedo
+                    if (needsRebuild) break;
+
+                    const curr = sorted[i];
+                    const prev = sorted.slice(0, i);
+
+                    let best = prev[0];
+                    let bestD = haversineMeters(curr.lon, curr.lat, best.lon, best.lat);
+
+                    for (let j = 1; j < prev.length; j++) {
+                        const pp = prev[j];
+                        const d = haversineMeters(curr.lon, curr.lat, pp.lon, pp.lat);
+                        if (d < bestD) { bestD = d; best = pp; }
+                    }
+
+                    try {
+                        const data = await osrmRouteDriving(best.lon, best.lat, curr.lon, curr.lat, signal); const route = data.routes?.[0];
+                        if (route?.geometry?.coordinates) {
+                            const coords3857 = route.geometry.coordinates.map(([lo, la]) => fromLonLat([lo, la]));
+                            routesSource.addFeature(new Feature({ geometry: new LineString(coords3857) }));
+                            routesCount++;
+                            updateChips();
+                        }
+                    } catch (e) {
+                        if (e.name === "AbortError") return; // ou continue
+                        console.warn("Falha OSRM", e);
+                    }
+                }
+
+                setStatus("pronto");
+
+                // Se mudou algo durante a construção, o do/while roda de novo
+            } while (needsRebuild);
+
+            rebuilding = false;
+        }
+
+        let rebuildTimer = null;
+
+        function scheduleRebuild(ms = 150) {
+            clearTimeout(rebuildTimer);
+            rebuildTimer = setTimeout(() => rebuildRoutes(), ms);
+        }
+        // =========================
+        // Map click: add point (só se addEnabled ON)
+        // =========================
+        map.on("singleclick", async (evt) => {
+            if (!addEnabled) return;
+
+            // se clicou em cima de um marcador, não cria ponto (evita “duplicar” ao tentar mexer)
+            const hit = map.forEachFeatureAtPixel(evt.pixel, (f, layer) => (layer === markerLayer ? f : null));
+            if (hit) return;
+
+            try {
+                const [lon, lat] = toLonLat(evt.coordinate);
+                await insertPoint(lon, lat);
+                await scheduleRebuild(120);
+            } catch (e) {
+                console.warn(e);
+                setInfo("Erro ao adicionar ponto.");
+            }
+        });
+
+        // ✅ salvar quando soltar o arrasto
+        translate.on("translateend", async (evt) => {
+            try {
+                const features = evt.features.getArray();
+                if (!features.length) return;
+
+                setStatus("salvando…");
+                for (const f of features) {
+                    const id = Number(f.getId());
+                    const coord3857 = f.getGeometry().getCoordinates();
+                    const [lon, lat] = toLonLat(coord3857);
+                    await updatePointCoords(id, lon, lat);
+                    f.changed();
+                }
+                await scheduleRebuild(80);
+            } catch (e) {
+                console.warn(e);
+                setStatus("erro");
+                setInfo("Falha ao salvar posição do marcador.");
+            }
+        });
+
+        // =========================
+        // Export / Import / Clear
+        // =========================
+        btnExport.addEventListener("click", async () => {
+            try {
+                await dbSave();
+                const data = db.export();
+                const blob = new Blob([data], { type: "application/octet-stream" });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = DB_NAME;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+                setInfo("💾 Banco exportado.");
+            } catch (e) {
+                console.warn(e);
+                setInfo("Falha ao exportar.");
+            }
+        });
+
+        lblImport.addEventListener("click", () => fileImport.click());
+
+        fileImport.addEventListener("change", async () => {
+            const file = fileImport.files?.[0];
+            if (!file) return;
+
+            try {
+                const buf = new Uint8Array(await file.arrayBuffer());
+                db = new SQL.Database(buf);
+                dbInitSchema();
+                await dbSave();
+                await loadPointsFromDb();
+                setInfo("📥 Banco importado com sucesso.");
+            } catch (e) {
+                console.warn(e);
+                setInfo("Falha ao importar banco.");
+            } finally {
+                fileImport.value = "";
+            }
+        });
+
+        btnClear.addEventListener("click", async () => {
+            if (!confirm("Limpar tudo?")) return;
+
+            try {
+                markerSource.clear();
+                routesSource.clear();
+                routesCount = 0;
+                points.length = 0;
+
+                updateChips();
+                renderList();
+
+                db = new SQL.Database();
+                dbInitSchema();
+                await idbClear();
+                await dbSave();
+
+                setStatus("pronto");
+                setInfo("Tudo limpo.");
+            } catch (e) {
+                console.warn(e);
+                setInfo("Falha ao limpar.");
+            }
+        });
+
+        async function doSearchAddress({ createPin = false } = {}) {
+            const q = (addrInput.value || "").trim();
+            if (!q) { setInfo("Digite um endereço para buscar."); return; }
+
+            try {
+                setStatus("buscando endereço…");
+                const results = await geocodeAddress(q);
+
+                if (!results.length) {
+                    setStatus("pronto");
+                    setInfo("Nenhum resultado encontrado.");
+                    return;
+                }
+
+                // pega o melhor resultado
+                const r = results[0];
+                const lon = Number(r.lon);
+                const lat = Number(r.lat);
+                const label = r.display_name || q;
+
+                // centraliza
+                map.getView().animate({
+                    center: fromLonLat([lon, lat]),
+                    zoom: 16,
+                    duration: 450
+                });
+
+                setInfo("📍 " + label);
+
+                if (createPin) {
+                    await insertPoint(lon, lat);
+                    // melhor agendar (se você aplicou debounce) ou:
+                    await rebuildRoutes();
+                }
+
+                setStatus("pronto");
+            } catch (e) {
+                console.warn(e);
+                setStatus("erro");
+                setInfo("Falha ao buscar endereço.");
+            }
+        }
+
+        btnAddrSearch.addEventListener("click", () => doSearchAddress({ createPin: false }));
+        btnAddrPin.addEventListener("click", () => doSearchAddress({ createPin: true }));
+
+        addrInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") doSearchAddress({ createPin: false });
+        });
+
+        // =========================
+        // Boot
+        // =========================
+        (async () => {
+            try {
+                await dbLoadOrCreate();
+                await loadPointsFromDb();
+                updateChips();
+                renderList();
+                updateAddUI(); // aqui já ativa/desativa o translate conforme addEnabled
+            } catch (e) {
+                console.warn(e);
+                setStatus("erro");
+                listEl.innerHTML = `<div class="muted">Erro ao iniciar SQLite. Use http://localhost (Live Server).</div>`;
+            }
+        })();
+    </script>
+</body>
+
+</html>
